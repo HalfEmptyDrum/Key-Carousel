@@ -1,5 +1,5 @@
 {
-  "name": "@openclaw/llm-failover",
+  "name": "llm-failover",
   "version": "1.0.0",
   "description": "Resilient LLM key pool with cooldown rotation and automatic failover",
   "type": "module",

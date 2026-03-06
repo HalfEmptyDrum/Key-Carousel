@@ -1,4 +1,4 @@
-# @openclaw/llm-failover
+# llm-failover
 
 Resilient LLM key pool with cooldown rotation and automatic failover.
 
@@ -13,7 +13,7 @@ Distilled from a production AI gateway running dozens of agents continuously.
 ## Quick Start
 
 ```ts
-import { LlmKeyPool } from "@openclaw/llm-failover";
+import { LlmKeyPool } from "llm-failover";
 
 const pool = new LlmKeyPool({
   profiles: [
@@ -74,7 +74,7 @@ Cooldowns use exponential backoff to avoid hammering failing endpoints.
 The `classifyError` helper maps errors to failure reasons:
 
 ```ts
-import { classifyError } from "@openclaw/llm-failover";
+import { classifyError } from "llm-failover";
 
 const reason = classifyError(error);
 // "rate_limit" | "auth" | "auth_permanent" | "billing" | "timeout" | "model_not_found" | "format" | "unknown"
@@ -90,7 +90,7 @@ Classification sources:
 Throw `FailoverError` from your task to explicitly signal "retry with next profile":
 
 ```ts
-import { FailoverError } from "@openclaw/llm-failover";
+import { FailoverError } from "llm-failover";
 
 const result = await pool.run(async (ctx) => {
   const res = await fetch(/* ... */);
@@ -153,7 +153,7 @@ const pool = new LlmKeyPool({
 
 ## Should I Use This vs LiteLLM?
 
-| | @openclaw/llm-failover | LiteLLM |
+| | llm-failover | LiteLLM |
 |---|---|---|
 | **Architecture** | In-process library | Separate proxy process |
 | **Infrastructure** | Zero | Requires running a proxy server |
