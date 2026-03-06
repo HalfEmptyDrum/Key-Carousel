@@ -1,3 +1,32 @@
+"use strict";
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+
+// src/index.ts
+var index_exports = {};
+__export(index_exports, {
+  AllProfilesExhaustedError: () => AllProfilesExhaustedError,
+  FailoverError: () => FailoverError,
+  LlmKeyPool: () => LlmKeyPool,
+  classifyError: () => classifyError
+});
+module.exports = __toCommonJS(index_exports);
+
 // src/errors.ts
 var FailoverError = class extends Error {
   failureReason;
@@ -119,19 +148,19 @@ function computeCooldownMs(errorCount, reason, config) {
 }
 
 // src/persistence.ts
-import { open, readFile, rename, unlink, writeFile } from "fs/promises";
-import { dirname, join } from "path";
+var import_promises = require("fs/promises");
+var import_node_path = require("path");
 var LOCK_RETRY_MS = 50;
 var LOCK_MAX_RETRIES = 20;
 async function acquireLock(lockPath) {
   let retries = 0;
   while (retries < LOCK_MAX_RETRIES) {
     try {
-      const fd2 = await open(lockPath, "wx");
+      const fd2 = await (0, import_promises.open)(lockPath, "wx");
       await fd2.close();
       return async () => {
         try {
-          await unlink(lockPath);
+          await (0, import_promises.unlink)(lockPath);
         } catch {
         }
       };
@@ -145,21 +174,21 @@ async function acquireLock(lockPath) {
     }
   }
   try {
-    await unlink(lockPath);
+    await (0, import_promises.unlink)(lockPath);
   } catch {
   }
-  const fd = await open(lockPath, "wx");
+  const fd = await (0, import_promises.open)(lockPath, "wx");
   await fd.close();
   return async () => {
     try {
-      await unlink(lockPath);
+      await (0, import_promises.unlink)(lockPath);
     } catch {
     }
   };
 }
 async function loadState(storagePath, logger) {
   try {
-    const raw = await readFile(storagePath, "utf-8");
+    const raw = await (0, import_promises.readFile)(storagePath, "utf-8");
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object" && "version" in parsed && parsed.version === 1) {
       return parsed;
@@ -192,9 +221,9 @@ async function saveState(storagePath, profiles, _logger) {
         lastFailureReason: p.lastFailureReason
       };
     }
-    const tmpPath = join(dirname(storagePath), `.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    await writeFile(tmpPath, JSON.stringify(state, null, 2), "utf-8");
-    await rename(tmpPath, storagePath);
+    const tmpPath = (0, import_node_path.join)((0, import_node_path.dirname)(storagePath), `.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await (0, import_promises.writeFile)(tmpPath, JSON.stringify(state, null, 2), "utf-8");
+    await (0, import_promises.rename)(tmpPath, storagePath);
   } finally {
     await release();
   }
@@ -522,10 +551,11 @@ var LlmKeyPool = class {
     });
   }
 };
-export {
+// Annotate the CommonJS export names for ESM import in node:
+0 && (module.exports = {
   AllProfilesExhaustedError,
   FailoverError,
   LlmKeyPool,
   classifyError
-};
-//# sourceMappingURL=index.js.map
+});
+//# sourceMappingURL=index.cjs.map

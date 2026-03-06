@@ -1,15 +1,23 @@
 {
-  "name": "llm-failover",
-  "version": "1.0.0",
+  "name": "key-carousel",
+  "version": "1.1.0",
   "description": "Resilient LLM key pool with cooldown rotation and automatic failover",
   "type": "module",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup",
     "test": "vitest run",

@@ -6,7 +6,6 @@ import type {
   CooldownConfig,
   FailedAttempt,
   FailureReason,
-  FallbackModelDefinition,
   LlmKeyPoolConfig,
   LlmKeyPoolResult,
   Logger,
@@ -19,30 +18,85 @@ import type {
 export class LlmKeyPool {
   private readonly profiles: Map<string, ProfileState> = new Map();
   private readonly profileOrder: string[] = [];
-  private readonly fallbackModels: FallbackModelDefinition[];
+  private readonly fallbackOrder: string[] = [];
   private readonly storagePath?: string;
   private readonly cooldownConfig: Required<CooldownConfig>;
+  private readonly maxWaitMs?: number;
   private readonly logger?: Logger;
 
   constructor(config: LlmKeyPoolConfig) {
-    this.fallbackModels = config.fallbackModels ?? [];
     this.storagePath = config.storagePath;
     this.cooldownConfig = resolvedConfig(config.cooldowns);
+    this.maxWaitMs = config.maxWaitMs;
     this.logger = config.logger;
 
+    // Validate cooldown config
+    if (config.cooldowns) {
+      const cd = config.cooldowns;
+      if (cd.maxRateLimitCooldownMs !== undefined && cd.maxRateLimitCooldownMs < 0) {
+        throw new Error("maxRateLimitCooldownMs must be non-negative");
+      }
+      if (cd.billingBackoffMs !== undefined && cd.billingBackoffMs < 0) {
+        throw new Error("billingBackoffMs must be non-negative");
+      }
+      if (cd.billingMaxMs !== undefined && cd.billingMaxMs < 0) {
+        throw new Error("billingMaxMs must be non-negative");
+      }
+      if (cd.failureWindowMs !== undefined && cd.failureWindowMs < 0) {
+        throw new Error("failureWindowMs must be non-negative");
+      }
+    }
+
+    // Register primary profiles
     let idx = 0;
     for (const def of config.profiles) {
       const id = def.id ?? `profile-${idx}`;
+      if (this.profiles.has(id)) {
+        throw new Error(`Duplicate profile ID: "${id}"`);
+      }
+      if (!def.apiKey) {
+        throw new Error(`Profile "${id}" has an empty API key`);
+      }
+      if (!def.provider) {
+        throw new Error(`Profile "${id}" has an empty provider`);
+      }
       this.profiles.set(id, {
         id,
         provider: def.provider,
         model: def.model,
         apiKey: def.apiKey,
-        weight: def.weight ?? 1,
         errorCount: 0,
       });
       this.profileOrder.push(id);
       idx++;
+    }
+
+    // Register fallback models as independent profiles
+    const fallbackModels = config.fallbackModels ?? [];
+    for (const fb of fallbackModels) {
+      const fallbackId = `fallback-${fb.provider}-${fb.model}`;
+      const matchingProfile = this.profileOrder.find(
+        (id) => this.profiles.get(id)!.provider === fb.provider,
+      );
+      const apiKey = fb.apiKey ?? (matchingProfile ? this.profiles.get(matchingProfile)!.apiKey : undefined);
+      if (apiKey) {
+        if (this.profiles.has(fallbackId)) {
+          throw new Error(`Duplicate fallback ID: "${fallbackId}"`);
+        }
+        this.profiles.set(fallbackId, {
+          id: fallbackId,
+          provider: fb.provider,
+          model: fb.model,
+          apiKey,
+          errorCount: 0,
+        });
+        this.fallbackOrder.push(fallbackId);
+      }
+    }
+
+    // Validate that there's at least one usable profile
+    if (this.profiles.size === 0) {
+      throw new Error("At least one profile or fallback with an API key is required");
     }
   }
 
@@ -75,7 +129,7 @@ export class LlmKeyPool {
         throw opts.signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
       }
 
-      const candidate = this.pickCandidate(candidates, opts);
+      const candidate = this.pickCandidate(candidates);
 
       if (!candidate) {
         // All profiles in cooldown — wait for soonest expiry
@@ -84,6 +138,12 @@ export class LlmKeyPool {
           // All permanently disabled
           throw new AllProfilesExhaustedError(attempts);
         }
+
+        const maxWait = opts?.maxWaitMs ?? this.maxWaitMs;
+        if (maxWait !== undefined && waitMs > maxWait) {
+          throw new AllProfilesExhaustedError(attempts);
+        }
+
         this.logger?.warn?.(
           `[${opts?.label ?? "llm-failover"}] All profiles in cooldown, waiting ${Math.round(waitMs / 1000)}s`,
         );
@@ -142,7 +202,12 @@ export class LlmKeyPool {
     const now = Date.now();
 
     // Window immutability: if there's an active cooldown, don't extend it
+    // But still track the failure for proper escalation when cooldown expires
     if (profile.cooldownUntil && profile.cooldownUntil > now) {
+      profile.errorCount++;
+      profile.lastFailure = now;
+      profile.lastFailureReason = reason;
+      await this.persist();
       return;
     }
 
@@ -204,7 +269,8 @@ export class LlmKeyPool {
     let totalInCooldown = 0;
     let lastUnavailableReason: FailureReason | null = null;
 
-    for (const id of this.profileOrder) {
+    const allIds = [...this.profileOrder, ...this.fallbackOrder];
+    for (const id of allIds) {
       const p = this.profiles.get(id)!;
       let state: "available" | "cooldown" | "disabled";
       if (p.cooldownUntil && p.cooldownUntil > now) {
@@ -244,117 +310,63 @@ export class LlmKeyPool {
 
   private buildCandidates(
     opts?: RunOptions,
-  ): Array<{ profileId: string; fallbackModel?: FallbackModelDefinition }> {
-    // Primary profiles matching the requested provider
-    const candidates: Array<{ profileId: string; fallbackModel?: FallbackModelDefinition }> = [];
+  ): Array<{ profileId: string; priority: number }> {
+    const candidates: Array<{ profileId: string; priority: number }> = [];
 
+    // Primary profiles: preferred provider first (priority 0), others second (priority 1)
     for (const id of this.profileOrder) {
       const p = this.profiles.get(id)!;
-      if (opts?.provider && p.provider !== opts.provider) continue;
-      candidates.push({ profileId: id });
-    }
-
-    // Also include profiles not matching provider (lower priority)
-    for (const id of this.profileOrder) {
-      const p = this.profiles.get(id)!;
-      if (!opts?.provider || p.provider === opts.provider) continue;
-      candidates.push({ profileId: id });
-    }
-
-    // Fallback models
-    for (const fb of this.fallbackModels) {
-      // Check if there's an existing profile for this fallback's provider
-      const matchingProfile = this.profileOrder.find(
-        (id) => this.profiles.get(id)!.provider === fb.provider,
-      );
-      if (matchingProfile || fb.apiKey) {
-        candidates.push({
-          profileId: matchingProfile ?? `fallback-${fb.provider}-${fb.model}`,
-          fallbackModel: fb,
-        });
+      if (opts?.provider && p.provider !== opts.provider) {
+        candidates.push({ profileId: id, priority: 1 });
+      } else {
+        candidates.push({ profileId: id, priority: 0 });
       }
+    }
+
+    // Fallback profiles (priority 2)
+    for (const id of this.fallbackOrder) {
+      candidates.push({ profileId: id, priority: 2 });
     }
 
     return candidates;
   }
 
   private pickCandidate(
-    candidates: Array<{ profileId: string; fallbackModel?: FallbackModelDefinition }>,
-    opts?: RunOptions,
-  ): (ProfileState & { model?: string }) | null {
+    candidates: Array<{ profileId: string; priority: number }>,
+  ): ProfileState | null {
     const now = Date.now();
 
-    // Resolve profile ordering among available candidates
-    const available: ProfileState[] = [];
-    for (const c of candidates) {
+    // Group available candidates by priority
+    const groups = new Map<number, Array<{ profile: ProfileState; candidateIndex: number }>>();
+
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i]!;
       const p = this.profiles.get(c.profileId);
-      if (!p) {
-        // Fallback with its own apiKey that doesn't match existing profile
-        if (c.fallbackModel?.apiKey) {
-          // Create an ephemeral profile state
-          const ephemeral: ProfileState = {
-            id: c.profileId,
-            provider: c.fallbackModel.provider,
-            model: c.fallbackModel.model,
-            apiKey: c.fallbackModel.apiKey,
-            weight: 1,
-            errorCount: 0,
-          };
-          available.push(ephemeral);
-        }
-        continue;
-      }
+      if (!p) continue;
       if (p.cooldownUntil && p.cooldownUntil > now) continue;
 
-      // If this candidate has a fallback model override, create a view with that model
-      if (c.fallbackModel) {
-        available.push({
-          ...p,
-          model: c.fallbackModel.model,
-          apiKey: c.fallbackModel.apiKey ?? p.apiKey,
-        });
-      } else {
-        available.push(p);
-      }
+      if (!groups.has(c.priority)) groups.set(c.priority, []);
+      groups.get(c.priority)!.push({ profile: p, candidateIndex: i });
     }
 
-    if (available.length === 0) return null;
+    // Pick from lowest priority number first (0 = preferred provider, 1 = other, 2 = fallback)
+    const priorities = [...groups.keys()].sort((a, b) => a - b);
+    for (const priority of priorities) {
+      const group = groups.get(priority)!;
+      if (group.length === 0) continue;
 
-    // Sort by priority tier then round-robin
-    return this.sortByPriority(available, opts);
-  }
+      // Round-robin: sort by lastUsed ascending (never-used profiles first)
+      group.sort((a, b) => {
+        const aLastUsed = a.profile.lastUsed ?? -1;
+        const bLastUsed = b.profile.lastUsed ?? -1;
+        if (aLastUsed !== bLastUsed) return aLastUsed - bLastUsed;
+        return a.candidateIndex - b.candidateIndex;
+      });
 
-  /**
-   * Profile ordering algorithm:
-   * 1. Tier 1: used recently AND succeeded — sorted by lastUsed (oldest first for round-robin)
-   * 2. Tier 2: never used or no errors — sorted by index for stability
-   * 3. Within each tier, pick the profile with the oldest lastUsed (round-robin)
-   */
-  private sortByPriority(
-    profiles: ProfileState[],
-    _opts?: RunOptions,
-  ): ProfileState {
-    const tier1: ProfileState[] = [];
-    const tier2: ProfileState[] = [];
-
-    for (const p of profiles) {
-      if (p.lastSuccess && p.lastUsed) {
-        tier1.push(p);
-      } else {
-        tier2.push(p);
-      }
+      return group[0]!.profile;
     }
 
-    // Tier 1: round-robin — pick oldest lastUsed
-    tier1.sort((a, b) => (a.lastUsed ?? 0) - (b.lastUsed ?? 0));
-    // Tier 2: stable order by index in profileOrder
-    tier2.sort(
-      (a, b) => this.profileOrder.indexOf(a.id) - this.profileOrder.indexOf(b.id),
-    );
-
-    // Tier 1 has priority, pick from it first (oldest lastUsed = round-robin)
-    if (tier1.length > 0) return tier1[0]!;
-    return tier2[0]!;
+    return null;
   }
 
   private soonestCooldownWait(): number | null {

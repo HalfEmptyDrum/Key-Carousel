@@ -10,16 +10,21 @@ export function classifyError(error: unknown): FailureReason {
   }
 
   const status = extractStatus(error);
+  const message = extractMessage(error).toLowerCase();
+
   if (status !== undefined) {
     if (status === 401) return "auth";
     if (status === 403) return "auth_permanent";
     if (status === 402) return "billing";
-    if (status === 429) return "rate_limit";
+    if (status === 429) {
+      // OpenAI returns 429 for both rate limits and exhausted quotas
+      if (/quota|insufficient/i.test(message)) return "billing";
+      return "rate_limit";
+    }
     if (status === 404) return "model_not_found";
     if (status === 400) return "format";
+    if (status === 503 || status === 529) return "server_error";
   }
-
-  const message = extractMessage(error).toLowerCase();
 
   if (/rate.?limit|too many requests|throttl/i.test(message)) return "rate_limit";
   if (/billing|payment|quota.*(exceeded|limit)|insufficient.*(fund|credit)/i.test(message))
@@ -29,6 +34,7 @@ export function classifyError(error: unknown): FailureReason {
   if (/model.*not.*found|does not exist|unknown model/i.test(message)) return "model_not_found";
   if (/context.length|token.*limit|max.*token/i.test(message)) return "format";
   if (/timeout|timed?.out|ETIMEDOUT|ECONNABORTED/i.test(message)) return "timeout";
+  if (/service.unavailable|overloaded/i.test(message)) return "server_error";
 
   if (isAbortError(error)) return "timeout";
 

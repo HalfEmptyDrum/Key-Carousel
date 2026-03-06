@@ -94,9 +94,6 @@ describe("LlmKeyPool", () => {
 
     expect(pool.isInCooldown("a")).toBe(false);
 
-    // Now profile "a" should be available again
-    // But "b" was last successful, so it may be picked first (tier 1)
-    // "a" is tier 2 (never succeeded). Let's verify "a" is at least not excluded
     const status = pool.getStatus();
     const profileA = status.profiles.find((p) => p.id === "a");
     expect(profileA!.state).toBe("available");
@@ -118,8 +115,6 @@ describe("LlmKeyPool", () => {
 
     // Rate limit would only be 1 min
     await pool.markFailure("b", "rate_limit");
-    const profileB = status.profiles.find((p) => p.id === "b");
-    // Need to refresh status
     const status2 = pool.getStatus();
     const profileB2 = status2.profiles.find((p) => p.id === "b");
     expect(profileB2!.state).toBe("cooldown");
@@ -191,56 +186,61 @@ describe("LlmKeyPool", () => {
     expect(result.profileId).toBe("b");
   });
 
-  // ── Profile ordering: last-good first ─────────────
+  // ── Round-robin rotation ──────────────────────────
 
-  it("profileOrder: last-good profiles come first", async () => {
+  it("round-robin: rotates through all profiles", async () => {
     const pool = makePool();
 
-    // Use profile "a" successfully
-    await pool.run(async (ctx) => {
-      if (ctx.profileId !== "a") throw new FailoverError("skip", { reason: "unknown" });
-      return "ok";
-    });
-
-    // Use profile "b" successfully — advance time so "b" is more recent
-    vi.advanceTimersByTime(1000);
-    await pool.markSuccess("b");
-
-    // Now "a" should be picked (oldest lastUsed in tier 1 = round-robin)
-    vi.advanceTimersByTime(1000);
-    const result = await pool.run(async () => "got-it");
-    expect(result.profileId).toBe("a");
-  });
-
-  // ── Round-robin among equal tier ──────────────────
-
-  it("profileOrder: round-robin among equal-tier profiles", async () => {
-    const pool = makePool();
-
-    // time=0: First call picks "a" (tier 2, stable order). a.lastUsed=0
+    // First call: picks "a" (all untested, config order tiebreak)
     const r1 = await pool.run(async () => "ok");
     expect(r1.profileId).toBe("a");
 
-    // Make "b" a tier-1 profile too via markSuccess
-    vi.advanceTimersByTime(1000); // time=1000
-    await pool.markSuccess("b"); // b.lastUsed=1000
-
-    // time=2000: Tier 1 has a(lastUsed=0) and b(lastUsed=1000). Oldest = "a".
+    // Second call: picks "b" (untested, preferred over recently-used "a")
     vi.advanceTimersByTime(1000);
     const r2 = await pool.run(async () => "ok");
-    expect(r2.profileId).toBe("a"); // picks "a" (oldest lastUsed)
-    // After success: a.lastUsed=2000
+    expect(r2.profileId).toBe("b");
 
-    // time=3000: Tier 1 has a(lastUsed=2000) and b(lastUsed=1000). Oldest = "b".
+    // Third call: picks "c" (untested, preferred over "a" and "b")
     vi.advanceTimersByTime(1000);
     const r3 = await pool.run(async () => "ok");
-    expect(r3.profileId).toBe("b"); // picks "b" (oldest lastUsed)
-    // After success: b.lastUsed=3000
+    expect(r3.profileId).toBe("c");
 
-    // time=4000: Tier 1 has a(lastUsed=2000) and b(lastUsed=3000). Oldest = "a".
+    // Fourth call: all used, "a" has oldest lastUsed → round-robin back
     vi.advanceTimersByTime(1000);
     const r4 = await pool.run(async () => "ok");
-    expect(r4.profileId).toBe("a"); // round-robin back to "a"
+    expect(r4.profileId).toBe("a");
+
+    // Fifth call: "b" has oldest lastUsed
+    vi.advanceTimersByTime(1000);
+    const r5 = await pool.run(async () => "ok");
+    expect(r5.profileId).toBe("b");
+  });
+
+  it("round-robin among profiles with mixed usage", async () => {
+    const pool = makePool();
+
+    // Use "a" successfully at time=0
+    const r1 = await pool.run(async () => "ok");
+    expect(r1.profileId).toBe("a");
+
+    // Manually mark "b" as used at time=1000
+    vi.advanceTimersByTime(1000);
+    await pool.markSuccess("b");
+
+    // time=2000: "c" has never been used, picks "c"
+    vi.advanceTimersByTime(1000);
+    const r2 = await pool.run(async () => "ok");
+    expect(r2.profileId).toBe("c");
+
+    // time=3000: a(0), b(1000), c(2000). "a" is oldest → picks "a"
+    vi.advanceTimersByTime(1000);
+    const r3 = await pool.run(async () => "ok");
+    expect(r3.profileId).toBe("a");
+
+    // time=4000: a(3000), b(1000), c(2000). "b" is oldest → picks "b"
+    vi.advanceTimersByTime(1000);
+    const r4 = await pool.run(async () => "ok");
+    expect(r4.profileId).toBe("b");
   });
 
   // ── Failure window decay ──────────────────────────
@@ -292,7 +292,148 @@ describe("LlmKeyPool", () => {
     const status2 = pool.getStatus();
     // Cooldown should NOT have been extended
     expect(status2.profiles[0]!.cooldownUntil).toBe(originalCooldown);
-    expect(status2.profiles[0]!.errorCount).toBe(1); // didn't increment
+    // But errorCount DOES increment during cooldown (for proper escalation)
+    expect(status2.profiles[0]!.errorCount).toBe(2);
+  });
+
+  // ── Provider filtering ────────────────────────────
+
+  it("provider filter prefers matching profiles", async () => {
+    const pool = makePool();
+    const used: string[] = [];
+
+    // Request anthropic provider
+    const r1 = await pool.run(
+      async (ctx) => {
+        used.push(ctx.profileId);
+        return "ok";
+      },
+      { provider: "anthropic" },
+    );
+    expect(r1.provider).toBe("anthropic");
+    expect(["a", "b"]).toContain(r1.profileId);
+  });
+
+  it("provider filter still works after first use", async () => {
+    const pool = makePool();
+
+    // First call without provider filter — uses "a" (anthropic)
+    await pool.run(async () => "ok");
+
+    // Second call with openai provider filter — should pick "c"
+    vi.advanceTimersByTime(1000);
+    const r2 = await pool.run(async () => "ok", { provider: "openai" });
+    expect(r2.profileId).toBe("c");
+    expect(r2.provider).toBe("openai");
+
+    // Third call with anthropic provider filter — should pick "b" (untested) or "a"
+    vi.advanceTimersByTime(1000);
+    const r3 = await pool.run(async () => "ok", { provider: "anthropic" });
+    expect(r3.provider).toBe("anthropic");
+    expect(["a", "b"]).toContain(r3.profileId);
+  });
+
+  // ── maxWaitMs ─────────────────────────────────────
+
+  it("maxWaitMs: throws immediately when cooldown exceeds max wait", async () => {
+    const pool = makePool({
+      profiles: [{ id: "a", provider: "anthropic", apiKey: "key-a" }],
+    });
+
+    // Put profile in cooldown (60s)
+    await pool.markFailure("a", "rate_limit");
+
+    // Run with maxWaitMs of 10s — should throw immediately since cooldown is 60s
+    await expect(
+      pool.run(async () => "ok", { maxWaitMs: 10_000 }),
+    ).rejects.toThrow(AllProfilesExhaustedError);
+  });
+
+  it("maxWaitMs: global config applies when per-call not set", async () => {
+    const pool = makePool({
+      profiles: [{ id: "a", provider: "anthropic", apiKey: "key-a" }],
+      maxWaitMs: 5_000,
+    });
+
+    await pool.markFailure("a", "rate_limit");
+
+    await expect(pool.run(async () => "ok")).rejects.toThrow(AllProfilesExhaustedError);
+  });
+
+  // ── Fallback models ───────────────────────────────
+
+  it("fallback models have independent state from primary profiles", async () => {
+    const pool = makePool({
+      profiles: [
+        { id: "primary", provider: "anthropic", model: "claude-opus", apiKey: "key-1" },
+      ],
+      fallbackModels: [
+        { provider: "anthropic", model: "claude-haiku" },
+      ],
+    });
+
+    // Put primary in cooldown
+    await pool.markFailure("primary", "rate_limit");
+    expect(pool.isInCooldown("primary")).toBe(true);
+
+    // Fallback should NOT be in cooldown (independent state)
+    expect(pool.isInCooldown("fallback-anthropic-claude-haiku")).toBe(false);
+
+    // Run should use the fallback
+    const result = await pool.run(async (ctx) => ctx.model);
+    expect(result.value).toBe("claude-haiku");
+    expect(result.profileId).toBe("fallback-anthropic-claude-haiku");
+  });
+
+  // ── Input validation ──────────────────────────────
+
+  it("rejects duplicate profile IDs", () => {
+    expect(
+      () =>
+        new LlmKeyPool({
+          profiles: [
+            { id: "dup", provider: "anthropic", apiKey: "key-1" },
+            { id: "dup", provider: "openai", apiKey: "key-2" },
+          ],
+        }),
+    ).toThrow('Duplicate profile ID: "dup"');
+  });
+
+  it("rejects empty API key", () => {
+    expect(
+      () =>
+        new LlmKeyPool({
+          profiles: [{ id: "x", provider: "anthropic", apiKey: "" }],
+        }),
+    ).toThrow("empty API key");
+  });
+
+  it("rejects empty provider", () => {
+    expect(
+      () =>
+        new LlmKeyPool({
+          profiles: [{ id: "x", provider: "", apiKey: "key-x" }],
+        }),
+    ).toThrow("empty provider");
+  });
+
+  it("rejects negative cooldown values", () => {
+    expect(
+      () =>
+        new LlmKeyPool({
+          profiles: [{ id: "x", provider: "anthropic", apiKey: "key-x" }],
+          cooldowns: { maxRateLimitCooldownMs: -1000 },
+        }),
+    ).toThrow("non-negative");
+  });
+
+  it("rejects empty profiles with no usable fallbacks", () => {
+    expect(
+      () =>
+        new LlmKeyPool({
+          profiles: [],
+        }),
+    ).toThrow("At least one profile");
   });
 
   // ── Persistence ───────────────────────────────────
@@ -381,6 +522,18 @@ describe("classifyError", () => {
     expect(classifyError(err)).toBe("rate_limit");
   });
 
+  it("classifies HTTP 429 with quota message as billing", () => {
+    const err = new Error("You exceeded your current quota");
+    (err as Record<string, unknown>)["status"] = 429;
+    expect(classifyError(err)).toBe("billing");
+  });
+
+  it("classifies HTTP 429 with insufficient_quota as billing", () => {
+    const err = new Error("insufficient_quota");
+    (err as Record<string, unknown>)["status"] = 429;
+    expect(classifyError(err)).toBe("billing");
+  });
+
   it("classifies HTTP 401 as auth", () => {
     const err = new Error("unauthorized");
     (err as Record<string, unknown>)["status"] = 401;
@@ -411,6 +564,18 @@ describe("classifyError", () => {
     expect(classifyError(err)).toBe("format");
   });
 
+  it("classifies HTTP 503 as server_error", () => {
+    const err = new Error("service unavailable");
+    (err as Record<string, unknown>)["status"] = 503;
+    expect(classifyError(err)).toBe("server_error");
+  });
+
+  it("classifies HTTP 529 (Anthropic overloaded) as server_error", () => {
+    const err = new Error("overloaded");
+    (err as Record<string, unknown>)["status"] = 529;
+    expect(classifyError(err)).toBe("server_error");
+  });
+
   it("classifies rate limit message pattern", () => {
     expect(classifyError(new Error("Rate limit exceeded"))).toBe("rate_limit");
   });
@@ -421,6 +586,11 @@ describe("classifyError", () => {
 
   it("classifies timeout message pattern", () => {
     expect(classifyError(new Error("Request timed out"))).toBe("timeout");
+  });
+
+  it("classifies server_error message pattern", () => {
+    expect(classifyError(new Error("Service unavailable"))).toBe("server_error");
+    expect(classifyError(new Error("API overloaded"))).toBe("server_error");
   });
 
   it("classifies AbortError as timeout", () => {

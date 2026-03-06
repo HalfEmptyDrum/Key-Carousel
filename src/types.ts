@@ -10,7 +10,6 @@ export type ProfileDefinition = {
   provider: string;
   model?: string;
   apiKey: string;
-  weight?: number;
 };
 
 export type FallbackModelDefinition = {
@@ -24,6 +23,7 @@ export type RunOptions = {
   provider?: string;
   signal?: AbortSignal;
   label?: string;
+  maxWaitMs?: number;
 };
 
 export type LlmKeyPoolResult<T> = {
@@ -44,6 +44,7 @@ export type FailedAttempt = {
 
 export type FailureReason =
   | "rate_limit"
+  | "server_error"
   | "auth"
   | "auth_permanent"
   | "billing"
@@ -71,6 +72,7 @@ export type LlmKeyPoolConfig = {
   fallbackModels?: FallbackModelDefinition[];
   storagePath?: string;
   cooldowns?: CooldownConfig;
+  maxWaitMs?: number;
   logger?: Logger;
 };
 
@@ -96,7 +98,6 @@ export type ProfileState = {
   provider: string;
   model?: string;
   apiKey: string;
-  weight: number;
   errorCount: number;
   lastUsed?: number;
   lastFailure?: number;
